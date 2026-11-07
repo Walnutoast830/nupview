@@ -7,6 +7,7 @@
     python nupview.py extract game.nup OUT [-p PACKAGE] [--path romfs/x] [--overwrite]
     python nupview.py set-icon game.nup IMAGE [-p PACKAGE] [-o new.nup]
     python nupview.py edit game.nup [--title T] [--developer D] [--version V] [--lang-title ja=T]
+    python nupview.py repair game.nup [--apply] [--verify] [--restore]
 
 Implements the reader side of SPEC.md v1 from https://github.com/a55uka/nup.
 Needs Python 3.10+. Zstandard support comes from the standard library on
@@ -977,6 +978,209 @@ def set_icon(path: str, icon: bytes, *, package: str | None = None, output: str 
                          overwrite=overwrite, cancel=cancel, progress=progress)
 
 
+# ---------------------------------------------------------------------------
+# Damaged containers
+# ---------------------------------------------------------------------------
+
+
+def reachable_nodes(nup: NupFile) -> tuple[set[int], set[int]]:
+    """Folders and files that can be reached from any package root."""
+    dirs: set[int] = set()
+    files: set[int] = set()
+    for pkg in nup.packages:
+        dirs.add(pkg.root_dir)
+        try:
+            for _parts, is_dir, index in nup.walk(pkg.root_dir):
+                (dirs if is_dir else files).add(index)
+        except NupError:
+            pass  # a loop: whatever was reached before it still counts
+    return dirs, files
+
+
+def unreachable_file_count(nup: NupFile) -> int:
+    return nup.file_count - len(reachable_nodes(nup)[1])
+
+
+@dataclass
+class CountFix:
+    dir_index: int
+    name: str
+    first: int
+    new_count: int
+    children: list[str]
+
+
+def find_count_fixes(nup: NupFile) -> tuple[list[CountFix], list[str]]:
+    """Find folders whose child count was written as 0 while their entries sit unused.
+
+    A fix is only proposed when it's unambiguous: exactly one empty folder starts at a run
+    of unused slots, every slot in the run holds a folder or file with no other parent,
+    and the names in the run are unique and sorted as the spec requires.
+    """
+    toc = nup._toc
+    slot_count = (nup._pool_off - nup._children_off) // 4
+    children = struct.unpack_from(f"<{slot_count}I", toc, nup._children_off)
+    records = list(_DIR.iter_unpack(toc[nup._dirs_off:nup._files_off]))
+    total = nup.dir_count + nup.file_count
+    used = bytearray(slot_count)
+    has_parent: set[int] = set()
+    for _off, _len, first, count, _ in records:
+        used[first:first + count] = b"\1" * count
+        has_parent.update(children[first:first + count])
+    roots = {pkg.root_dir for pkg in nup.packages}
+
+    def orphan(node: int) -> bool:
+        return node < total and node not in has_parent and node not in roots
+
+    def raw_name(node: int) -> bytes:
+        if node < nup.dir_count:
+            off, length = _DIR.unpack_from(toc, nup._dirs_off + node * _DIR.size)[:2]
+        else:
+            off, length = _FILE.unpack_from(toc, nup._files_off + (node - nup.dir_count) * _FILE.size)[:2]
+        start = nup._pool_off + off
+        return toc[start:start + length]
+
+    runs: dict[int, int] = {}
+    slot = 0
+    while slot < slot_count:
+        if used[slot] or not orphan(children[slot]):
+            slot += 1
+            continue
+        end = slot
+        while end < slot_count and not used[end] and orphan(children[end]):
+            end += 1
+        runs[slot] = end - slot
+        slot = end
+
+    empty_at: dict[int, list[int]] = {}
+    for index, (_off, _len, first, count, _) in enumerate(records):
+        if count == 0 and first in runs:
+            empty_at.setdefault(first, []).append(index)
+
+    fixes: list[CountFix] = []
+    notes: list[str] = []
+    for first, length in sorted(runs.items()):
+        candidates = empty_at.get(first, [])
+        nodes = children[first:first + length]
+        names = [raw_name(node) for node in nodes]
+        label = ", ".join(n.decode("utf-8", "replace") for n in names[:4]) + (", …" if length > 4 else "")
+        if len(candidates) != 1:
+            notes.append(f"{length} unlinked entries at slot {first} ({label}): "
+                         + ("no empty folder points at them" if not candidates
+                            else f"{len(candidates)} empty folders point at them, so it's ambiguous"))
+            continue
+        if len(set(nodes)) != length or names != sorted(names) or len(set(names)) != length:
+            notes.append(f"{length} unlinked entries at slot {first} ({label}): "
+                         "names aren't unique and sorted, so they may not belong together")
+            continue
+        fixes.append(CountFix(candidates[0], nup.dir_name(candidates[0]), first, length,
+                              [n.decode("utf-8", "replace") for n in names]))
+    return fixes, notes
+
+
+def _backup_path(path: str) -> str:
+    return path + ".toc-backup.bin"
+
+
+def apply_count_fixes(path: str, fixes: list[CountFix]) -> str:
+    """Save the header and TOC, apply the fixes in place, and check the result.
+
+    Only the child counts and the TOC checksum change. If the result doesn't open with more
+    files reachable than before, the original bytes are written back.
+    """
+    nup = NupFile(path)
+    before = unreachable_file_count(nup)
+    backup = _backup_path(nup.path)
+    with open(nup.path, "rb") as fh:
+        original = fh.read(nup.toc_offset + nup.toc_size)
+    if os.path.exists(backup):
+        with open(backup, "rb") as fh:
+            if fh.read() != original:
+                raise NupError(f"{backup} already exists and holds a different version. "
+                               "Move it somewhere safe first")
+    else:
+        with open(backup, "wb") as out:
+            out.write(original)
+            out.flush()
+            os.fsync(out.fileno())
+    with open(backup, "rb") as fh:
+        if fh.read() != original:
+            raise NupError("the backup couldn't be verified, so nothing was changed")
+
+    toc = bytearray(original[nup.toc_offset:])
+    for fix in fixes:
+        record = nup._dirs_off + fix.dir_index * _DIR.size
+        _off, _len, first, count, _ = _DIR.unpack_from(toc, record)
+        if (first, count) != (fix.first, 0):
+            raise NupError("the file changed since it was checked, so nothing was changed")
+        struct.pack_into("<I", toc, record + 0xC, fix.new_count)
+    digest = hashlib.sha256(toc).digest()
+    with open(nup.path, "r+b") as fh:
+        for fix in fixes:
+            fh.seek(nup.toc_offset + nup._dirs_off + fix.dir_index * _DIR.size + 0xC)
+            fh.write(struct.pack("<I", fix.new_count))
+        fh.seek(0x18)
+        fh.write(digest)
+        fh.flush()
+        os.fsync(fh.fileno())
+    try:
+        after = unreachable_file_count(NupFile(nup.path))
+        problem = None if after < before else "it didn't make any more files reachable"
+    except NupError as exc:
+        problem = str(exc)
+    if problem:
+        restore_toc_backup(nup.path)
+        raise NupError(f"the repair was undone because {problem}")
+    return backup
+
+
+def restore_toc_backup(path: str) -> str:
+    """Put back the header and TOC saved before a repair."""
+    backup = _backup_path(os.path.abspath(path))
+    with open(backup, "rb") as fh:
+        saved = fh.read()
+    if len(saved) < HEADER_SIZE or saved[:4] != b"NUP\x01":
+        raise NupError(f"{backup} isn't a NUP header backup")
+    toc_offset, toc_size = struct.unpack_from("<QQ", saved, 0x08)
+    if toc_offset + toc_size != len(saved) or hashlib.sha256(saved[toc_offset:]).digest() != saved[0x18:0x38]:
+        raise NupError(f"{backup} is damaged, so it wasn't restored")
+    if struct.unpack_from("<Q", saved, 0x40)[0] != os.path.getsize(path):
+        raise NupError(f"{backup} was made from a file of a different size")
+    with open(path, "r+b") as fh:
+        fh.write(saved)
+        fh.flush()
+        os.fsync(fh.fileno())
+    NupFile(path)
+    return backup
+
+
+def verify_contents(nup: NupFile, progress: Callable[[int, int], None] | None = None
+                    ) -> tuple[int, list[str]]:
+    """Check every file against its stored SHA-256. Shared extents are read once."""
+    total = sum(nup.file(i).size for i in range(nup.file_count))
+    seen: dict[tuple[int, int, bytes], bool] = {}
+    bad: list[str] = []
+    done = 0
+    with open(nup.path, "rb") as fh:
+        for index in range(nup.file_count):
+            entry = nup.file(index)
+            key = (entry.extent_offset, entry.extent_size, entry.sha256)
+            if key not in seen:
+                digest = hashlib.sha256()
+                try:
+                    for chunk in nup.iter_content(entry, fh):
+                        digest.update(chunk)
+                    seen[key] = digest.digest() == entry.sha256
+                except NupError:
+                    seen[key] = False
+            done += entry.size
+            if not seen[key]:
+                bad.append(entry.name)
+            if progress:
+                progress(done, total)
+    return nup.file_count, bad
+
+
 def human_size(n: int) -> str:
     value = float(n)
     for unit in ("B", "KB", "MB", "GB"):
@@ -1029,6 +1233,10 @@ def _cmd_info(args: argparse.Namespace) -> int:
     print(f"size:     {human_size(nup.file_size)} ({nup.file_size:,} bytes)")
     print(f"contents: {len(nup.packages)} packages, {nup.dir_count:,} dirs, "
           f"{nup.file_count:,} files")
+    missing = unreachable_file_count(nup)
+    if missing:
+        print(f"warning:  {missing:,} files aren't reachable from any package, so they won't "
+              f"be shown or extracted. Run: nupview.py repair \"{args.file}\"")
     for pkg in nup.packages:
         files, size = package_stats(nup, pkg)
         print(f"\n[{pkg.index}] {pkg.label}")
@@ -1152,6 +1360,55 @@ def _cmd_edit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_repair(args: argparse.Namespace) -> int:
+    if args.restore:
+        backup = restore_toc_backup(args.file)
+        print(f"restored the header and table from {backup}")
+        return 0
+    nup = NupFile(args.file)
+    missing = unreachable_file_count(nup)
+    fixes, notes = find_count_fixes(nup)
+    if not missing and not fixes:
+        print(f"no problems found: all {nup.file_count:,} files are reachable")
+    else:
+        print(f"{missing:,} of {nup.file_count:,} files aren't reachable from any package")
+    for fix in fixes:
+        listed = ", ".join(fix.children[:6]) + (", ..." if len(fix.children) > 6 else "")
+        print(f"  fixable: folder '{fix.name}' (#{fix.dir_index}) lists 0 entries, but its "
+              f"{fix.new_count} entries sit unused at slot {fix.first}: {listed}")
+    for note in notes:
+        print(f"  not fixable automatically: {note}")
+    status = 0
+    if fixes and not args.apply:
+        print("dry run: nothing was changed. Add --apply to fix it; the header and table are "
+              "backed up first.")
+        return 1
+    if fixes:
+        backup = apply_count_fixes(args.file, fixes)
+        nup = NupFile(args.file)
+        missing = unreachable_file_count(nup)
+        print(f"repaired {len(fixes)} folder count(s). Backup: {backup}")
+        print(f"now {nup.file_count - missing:,} of {nup.file_count:,} files are reachable")
+        print(f"to undo: nupview.py repair \"{args.file}\" --restore")
+    if missing:
+        status = 1
+    if args.verify:
+        show = sys.stderr.isatty()
+
+        def progress(done: int, total: int) -> None:
+            sys.stderr.write(f"\rchecking data: {done * 100 // max(total, 1):3d}%")
+
+        checked, bad = verify_contents(nup, progress if show else None)
+        if show:
+            sys.stderr.write("\n")
+        print(f"data check: {checked - len(bad):,} of {checked:,} files match their SHA-256")
+        for name in bad[:20]:
+            print(f"  corrupt: {name}")
+        if bad:
+            status = 1
+    return status
+
+
 # ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
@@ -1236,6 +1493,7 @@ class App:
         self.root.title("NUP Viewer")
         self.root.geometry("1120x700")
         self.nup: NupFile | None = None
+        self.missing_files = 0
         self.nodes: dict[str, Node] = {}
         self.stats: dict[int, tuple[int, int]] = {}
         self.top_items: list[str] = []
@@ -1386,6 +1644,7 @@ class App:
         try:
             nup = NupFile(path)
             stats = {pkg.index: package_stats(nup, pkg) for pkg in nup.packages}
+            missing = unreachable_file_count(nup)
         except (NupError, OSError) as exc:
             messagebox.showerror("Could not open file", f"{path}\n\n{exc}")
             return
@@ -1411,7 +1670,15 @@ class App:
         self.icon_btn.configure(state="normal")
         self.metadata_btn.configure(state="normal")
         self.search_entry.configure(state="normal")
+        self.missing_files = missing
         self._set_status_summary()
+        if missing:
+            messagebox.showwarning(
+                "Some files can't be reached",
+                f"{missing:,} of {nup.file_count:,} files in this container aren't linked into "
+                "any package, so they won't be shown or extracted.\n\nThis usually means the file "
+                "was packed with a bug. To check whether it can be repaired, run:\n\n"
+                f"python nupview.py repair \"{path}\"")
         if self.top_items:
             self.tree.selection_set(self.top_items[0])
             self.tree.focus(self.top_items[0])
@@ -1421,7 +1688,8 @@ class App:
     def _set_status_summary(self) -> None:
         nup = self.nup
         count = len(nup.packages)
-        self.status_var.set(f"{os.path.basename(nup.path)}  ·  {human_size(nup.file_size)}  ·  "
+        warning = f"  ·  ⚠ {self.missing_files:,} files unreachable" if self.missing_files else ""
+        self.status_var.set(f"{os.path.basename(nup.path)}{warning}  ·  {human_size(nup.file_size)}  ·  "
                             f"{count} package{'s' if count != 1 else ''}  ·  "
                             f"{nup.file_count:,} files")
 
@@ -1910,7 +2178,7 @@ def main(argv: list[str] | None = None) -> int:
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")  # game titles may not fit the console codepage
 
-    if not argv or argv[0] not in ("info", "ls", "extract", "set-icon", "edit", "-h", "--help"):
+    if not argv or argv[0] not in ("info", "ls", "extract", "set-icon", "edit", "repair", "-h", "--help"):
         if len(argv) > 1:
             print("usage: nupview.py [file.nup]  (or: info, ls, extract; see --help)",
                   file=sys.stderr)
@@ -1960,6 +2228,13 @@ def main(argv: list[str] | None = None) -> int:
                       "developer go on the base, the version on the newest update)")
     edit.add_argument("-o", "--output", help="write a new file instead of replacing this one")
     edit.set_defaults(fn=_cmd_edit)
+    repair = sub.add_parser("repair", help="find and fix folders cut off by a wrong child count "
+                            "(a dry run unless --apply)")
+    repair.add_argument("file")
+    repair.add_argument("--apply", action="store_true", help="make the fix; backs up the table first")
+    repair.add_argument("--verify", action="store_true", help="also check every file's SHA-256")
+    repair.add_argument("--restore", action="store_true", help="undo a repair from its backup")
+    repair.set_defaults(fn=_cmd_repair)
     args = parser.parse_args(argv)
     try:
         return args.fn(args)

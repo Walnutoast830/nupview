@@ -607,6 +607,96 @@ class EditMetadata(Base):
         self.assertEqual(nv.main(["edit", path]), 2)
 
 
+def set_child_count(data: bytearray, dir_index: int, count: int) -> bytearray:
+    """Rewrite one folder's child count and re-hash the TOC, like a buggy packer would."""
+    toc_size = struct.unpack_from("<Q", data, 0x10)[0]
+    toc = bytearray(data[0x80:0x80 + toc_size])
+    struct.pack_into("<I", toc, 0x30 + 0x40 + dir_index * 0x18 + 0xC, count)
+    data[0x80:0x80 + toc_size] = toc
+    data[0x18:0x38] = hashlib.sha256(toc).digest()
+    return data
+
+
+class Repair(Base):
+    TREE = {"romfs": {"a": b"1", "b": b"22", "sub": {"c": b"333"}}}
+
+    def broken(self) -> str:
+        # dir 0 is the root, dir 1 is romfs: write its count as 0, as a buggy packer did.
+        return self.write(bytes(set_child_count(build(self.TREE), 1, 0)))
+
+    def cli(self, *args: str) -> tuple[int, str]:
+        out = io.StringIO()
+        with unittest.mock.patch("sys.stdout", out):
+            code = nv.main(list(args))
+        return code, out.getvalue()
+
+    def test_info_warns_about_unreachable_files(self) -> None:
+        path = self.broken()
+        self.assertEqual(nv.unreachable_file_count(nv.NupFile(path)), 3)
+        code, text = self.cli("info", path)
+        self.assertEqual(code, 0)
+        self.assertIn("3 files aren't reachable", text)
+        self.assertNotIn("aren't reachable", self.cli("info", self.write(build(self.TREE), "ok.nup"))[1])
+
+    def test_finds_the_fix(self) -> None:
+        fixes, notes = nv.find_count_fixes(nv.NupFile(self.broken()))
+        self.assertEqual(notes, [])
+        self.assertEqual([(f.dir_index, f.name, f.new_count, f.children) for f in fixes],
+                         [(1, "romfs", 3, ["a", "b", "sub"])])
+
+    def test_dry_run_changes_nothing(self) -> None:
+        path = self.broken()
+        before = Path(path).read_bytes()
+        code, text = self.cli("repair", path)
+        self.assertEqual(code, 1)
+        self.assertIn("dry run", text)
+        self.assertEqual(Path(path).read_bytes(), before)
+        self.assertFalse(Path(path + ".toc-backup.bin").exists())
+
+    def test_apply_then_restore(self) -> None:
+        path = self.broken()
+        before = Path(path).read_bytes()
+        code, text = self.cli("repair", path, "--apply", "--verify")
+        self.assertEqual(code, 0, text)
+        self.assertIn("now 3 of 3 files are reachable", text)
+        self.assertIn("3 of 3 files match", text)
+        nup = nv.NupFile(path)
+        self.assertEqual(self.extract_all(nup).failures, [])
+        self.assertEqual((self.out / "romfs/sub/c").read_bytes(), b"333")
+        self.assertEqual(Path(path).read_bytes(), bytes(build(self.TREE)))  # same as a correct pack
+        self.assertEqual(self.cli("repair", path)[0], 0)  # nothing left to fix
+        code, _ = self.cli("repair", path, "--restore")
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(path).read_bytes(), before)
+
+    def test_unsorted_entries_are_left_alone(self) -> None:
+        data = build({"romfs": {"a": b"1", "b": b"22"}})
+        toc_size = struct.unpack_from("<Q", data, 0x10)[0]
+        toc = bytearray(data[0x80:0x80 + toc_size])
+        children = 0x30 + 0x40 + 2 * 0x18 + 2 * 0x50
+        first, second = struct.unpack_from("<II", toc, children + 4)
+        struct.pack_into("<II", toc, children + 4, second, first)  # b before a
+        data[0x80:0x80 + toc_size] = toc
+        data[0x18:0x38] = hashlib.sha256(toc).digest()
+        path = self.write(bytes(set_child_count(data, 1, 0)))
+        fixes, notes = nv.find_count_fixes(nv.NupFile(path))
+        self.assertEqual(fixes, [])
+        self.assertIn("aren't unique and sorted", notes[0])
+
+    def test_refuses_to_overwrite_a_different_backup(self) -> None:
+        path = self.broken()
+        Path(path + ".toc-backup.bin").write_bytes(b"something else")
+        before = Path(path).read_bytes()
+        with self.assertRaisesRegex(nv.NupError, "already exists"):
+            nv.apply_count_fixes(path, nv.find_count_fixes(nv.NupFile(path))[0])
+        self.assertEqual(Path(path).read_bytes(), before)
+
+    def test_healthy_file_reports_no_problems(self) -> None:
+        code, text = self.cli("repair", self.write(build(self.TREE)))
+        self.assertEqual(code, 0)
+        self.assertIn("no problems found", text)
+
+
 class Cli(Base):
     def test_extract_and_exit_codes(self) -> None:
         path = self.write(build({"romfs": {"a": b"1", "b": b"2"}}))

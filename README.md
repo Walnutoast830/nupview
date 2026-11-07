@@ -36,6 +36,19 @@ python nupview.py edit game.nup --developer ""
 
 `-p` takes a package index or a kind: `base`, `update` or `addon`. In `edit`, an empty value removes a field.
 
+## Repairing a container
+
+Some packers have written a folder's child count as 0 while its entries are still stored. The data is intact but cut off from the folder tree, so tools can't see it. `info` and the GUI warn when files aren't reachable from any package.
+
+```
+python nupview.py repair game.nup              # report only, changes nothing
+python nupview.py repair game.nup --apply      # fix it; saves game.nup.toc-backup.bin first
+python nupview.py repair game.nup --verify     # also check every file's SHA-256
+python nupview.py repair game.nup --restore    # undo, from the backup
+```
+
+`repair` only fixes unambiguous cases: exactly one empty folder pointing at a run of unused entries that have no other parent, with unique, sorted names. It changes only those counts and the table checksum, and undoes the change if the result isn't better. Anything else is reported but left alone.
+
 Extracting everything recreates the `base/`, `updates/<version>/` and `dlc/<id>/<n>/` layout that `nup pack` reads.
 
 ## Behaviour worth knowing
