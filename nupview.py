@@ -301,22 +301,18 @@ class NupFile:
             raise NupError("string pool out of bounds")
         self._pool_off, self._pool_size = pool_off, pool_size
 
-        slots = 0
-        for name_off, name_len, _first, child_count, _ in _DIR.iter_unpack(
+        # The children array runs up to the string pool. Some packers leave unused slots in it,
+        # so it can be longer than the directories' child counts add up to.
+        slots = (pool_off - self._children_off) // 4
+        children = struct.unpack_from(f"<{slots}I", toc, self._children_off)
+        node_total = self.dir_count + self.file_count
+        for name_off, name_len, first, child_count, _ in _DIR.iter_unpack(
                 toc[self._dirs_off:self._files_off]):
             self._check_name(name_off, name_len)
-            slots += child_count
-        self._slot_count = slots
-        if self._children_off + slots * 4 > len(toc):
-            raise NupError("children array out of bounds")
-        for _name_off, _name_len, first, child_count, _ in _DIR.iter_unpack(
-                toc[self._dirs_off:self._files_off]):
             if first + child_count > slots:
                 raise NupError("directory child range out of bounds")
-
-        node_total = self.dir_count + self.file_count
-        if slots and max(struct.unpack_from(f"<{slots}I", toc, self._children_off)) >= node_total:
-            raise NupError("directory entry points at a node that does not exist")
+            if child_count and max(children[first:first + child_count]) >= node_total:
+                raise NupError("directory entry points at a node that does not exist")
 
         for name_off, name_len, size, offset, stored, _sha, codec, _flags, _ in _FILE.iter_unpack(
                 toc[self._files_off:self._children_off]):

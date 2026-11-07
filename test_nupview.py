@@ -230,6 +230,26 @@ class Rejection(Base):
         corrupt[0x90] ^= 1
         self.assert_rejected(corrupt, "checksum")
 
+    def test_unused_children_slots_are_accepted(self) -> None:
+        # Some packers leave padding in the children array; its contents must be ignored.
+        data = build({"romfs": {"a": b"1", "b": b"22"}},
+                     children_override=lambda slots, _n: slots + [0xFFFFFFFF, 0xFFFFFFFF])
+        nup = nv.NupFile(self.write(bytes(data)))
+        result = self.extract_all(nup)
+        self.assertEqual((result.written, result.failures), (2, []))
+        self.assertEqual((self.out / "romfs/b").read_bytes(), b"22")
+
+    def test_child_range_past_the_array_is_rejected(self) -> None:
+        def overflow(slots, _n):
+            return slots  # the root claims more children than the array holds
+        data = build({"a": b"1"}, children_override=overflow)
+        toc_size = struct.unpack_from("<Q", data, 0x10)[0]
+        toc = bytearray(data[0x80:0x80 + toc_size])
+        struct.pack_into("<I", toc, 0x30 + 0x40 + 0xC, 5)  # root child_count
+        data[0x80:0x80 + toc_size] = toc
+        data[0x18:0x38] = hashlib.sha256(toc).digest()
+        self.assert_rejected(data, "child range out of bounds")
+
     def test_unknown_codec_rejected(self) -> None:
         data = build({"f": b"x"})
         toc_size = struct.unpack_from("<Q", data, 0x10)[0]
